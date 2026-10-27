@@ -1,0 +1,189 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function myRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isBuilderOrPm() {
+      return isSignedIn() && myRole() in ['builder', 'pm'];
+    }
+
+    // users: anyone signed in can read profiles (needed to show names on
+    // shared lists like attendance/progress overviews); a user can only
+    // create/update their own doc, and can't change their own role.
+    match /users/{uid} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.auth.uid == uid;
+      // A user can update their own doc but not change their own role.
+      // Builder/PM can additionally update *other* users' assignedProjectIds
+      // only (to assign them to projects) — nothing else on that doc.
+      allow update: if isSignedIn() && (
+                      (request.auth.uid == uid
+                        && request.resource.data.role == resource.data.role) ||
+                      (isBuilderOrPm()
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                            .hasOnly(['assignedProjectIds']))
+                    );
+    }
+
+    // projects: everyone signed in can read (screens filter client-side by
+    // assignment); only Builder/PM can create. Update is Builder/PM only,
+    // and only for the contractorScopes map or the location/coordinates
+    // fields (weather card) — nothing else is editable yet.
+    match /projects/{projectId} {
+      allow read: if isSignedIn();
+      allow create: if isBuilderOrPm();
+      allow update: if isBuilderOrPm()
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(['contractorScopes', 'location', 'latitude', 'longitude']);
+
+      // laborers: on-site headcount, no login account of their own — only
+      // Site Engineer/Supervisor manage the name list for a project.
+      match /laborers/{laborerId} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn() && myRole() in ['site_engineer', 'supervisor'];
+      }
+    }
+
+    // laborer_attendance: daily Present/Absent per laborer, marked by
+    // Site Engineer/Supervisor only. Everyone signed in can read (needed for
+    // Builder/PM's Attendance Overview headcount).
+    match /laborer_attendance/{recordId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && myRole() in ['site_engineer', 'supervisor'];
+    }
+
+    // staff_attendance: self check-in only, for the roles the matrix allows
+    // to check in — a user can only write their own record.
+    match /staff_attendance/{recordId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn()
+                    && myRole() in ['site_engineer', 'supervisor', 'contractor']
+                    && request.resource.data.userId == request.auth.uid;
+    }
+
+    // progress_logs: only PM/Site Engineer/Supervisor/Contractor can log
+    // progress, and only as themselves — matches the matrix's "progress
+    // photo upload" row (Builder and Vendor are excluded).
+    match /progress_logs/{logId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && myRole() in ['pm', 'site_engineer', 'supervisor', 'contractor']
+                    && request.resource.data.userId == request.auth.uid;
+    }
+
+    // tasks: PM/Site Engineer create and can edit anything on a task; the
+    // assignee (Supervisor) can only update the status field on their own
+    // task — matches the matrix's "assign tasks" row.
+    match /tasks/{taskId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && myRole() in ['pm', 'site_engineer'];
+      allow update: if isSignedIn() && (
+                      myRole() in ['pm', 'site_engineer'] ||
+                      (resource.data.assignedToUid == request.auth.uid
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                            .hasOnly(['status']))
+                    );
+    }
+
+    // material_requests: only Site Engineer raises one, as themselves; only
+    // PM approves/rejects — matches the matrix's "raise/approve material
+    // requests" rows.
+    match /material_requests/{requestId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && myRole() == 'site_engineer'
+                    && request.resource.data.raisedByUid == request.auth.uid;
+      allow update: if isSignedIn() && myRole() == 'pm';
+    }
+
+    // purchase_orders: only PM creates one (on approving a request); the
+    // assigned Vendor can update status and submit their invoice on their
+    // own PO — matches the matrix's "fulfill/dispatch materials" and
+    // "submit invoices" rows.
+    match /purchase_orders/{poId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && myRole() == 'pm';
+      allow update: if isSignedIn() && (
+                      myRole() == 'pm' ||
+                      (resource.data.vendorUid == request.auth.uid
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                            .hasOnly(['status', 'invoiceBase64', 'invoiceAmount', 'invoiceSubmittedAt']))
+                    );
+    }
+
+    // expenses: only PM logs one, as themselves, always starting 'pending';
+    // only Builder gives final approval/rejection, and only touching the
+    // approval fields — matches the matrix's "approve budgets/expenses" row.
+    match /expenses/{expenseId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && myRole() == 'pm'
+                    && request.resource.data.enteredByUid == request.auth.uid
+                    && request.resource.data.status == 'pending';
+      allow update: if isSignedIn() && myRole() == 'builder'
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(['status', 'approvedByUid', 'approvedAt']);
+    }
+
+    // safety_checklists: only Site Engineer/Supervisor conduct one, as
+    // themselves; visible to Builder/PM/Site Engineer/Supervisor only
+    // (Vendor/Contractor excluded) — matches the matrix's "safety
+    // checklists" rows.
+    match /safety_checklists/{checklistId} {
+      allow read: if isSignedIn() && myRole() in ['builder', 'pm', 'site_engineer', 'supervisor'];
+      allow create: if isSignedIn() && myRole() in ['site_engineer', 'supervisor']
+                    && request.resource.data.conductedByUid == request.auth.uid;
+    }
+
+    // inventory_items: readable by anyone signed in; writes restricted to
+    // Builder/PM, matching who the UI actually exposes this screen to.
+    match /inventory_items/{itemId} {
+      allow read: if isSignedIn();
+      allow write: if isBuilderOrPm();
+    }
+
+    // contractor_invoices: only Contractor submits one, as themselves;
+    // visible to Builder/PM/Contractor only — matches the matrix's
+    // "submit invoices" row for Contractor. PM can additionally mark one
+    // paid (Razorpay payment flow), touching only the payment fields.
+    match /contractor_invoices/{invoiceId} {
+      allow read: if isSignedIn() && myRole() in ['builder', 'pm', 'contractor'];
+      allow create: if isSignedIn() && myRole() == 'contractor'
+                    && request.resource.data.contractorUid == request.auth.uid;
+      allow update: if isSignedIn() && myRole() == 'pm'
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(['status', 'paymentId', 'paidAt']);
+    }
+
+    // chat_messages: one shared thread per project. Read is left open to any
+    // signed-in user (same trade-off as every other project-scoped
+    // collection in this app — membership is enforced client-side via
+    // `streamProjectsForUser`, not re-derived here); `create` only as
+    // yourself, and messages are immutable once sent (no update/delete).
+    match /chat_messages/{messageId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.senderUid == request.auth.uid;
+    }
+
+    // notifications: a user can only read/update their own; `create` is
+    // intentionally left open to any signed-in user (not restricted per
+    // notification type) since every one of the 6 trigger events is fired
+    // by whichever role's action already legitimately changed the
+    // underlying document — re-deriving "who's allowed to notify whom" here
+    // would duplicate every other collection's rules a second time. Known
+    // trade-off: a signed-in user could technically write a fake
+    // notification doc to another user; low-risk for this app's scope.
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && resource.data.recipientUid == request.auth.uid;
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && resource.data.recipientUid == request.auth.uid
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+    }
+  }
+}
